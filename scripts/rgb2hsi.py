@@ -8,7 +8,7 @@ from PIL import Image
 from tqdm import tqdm, trange
 from itertools import islice
 from einops import rearrange
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
@@ -18,12 +18,14 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
+from ldm.data.washinton_dc import DCTest as TestDataset
+# from ldm.data.urban import UrbanDataset as TestDataset
 # from ldm.data.icvl import ICVLTest as TestDataset
 # from ldm.data.cave import CAVEValidation as TestDataset
-from ldm.data.ntire_gen import NTIREValidate as TestDataset
+# from ldm.data.ntire_gen import NTIREValidate as TestDataset
 
 from utils import AverageMeter, initialize_logger, save_checkpoint, record_loss, \
-    time2file_name, Loss_MRAE, Loss_RMSE, Loss_PSNR, Loss_SAM, Loss_SSIM, save_matv73
+    time2file_name, Loss_MRAE, Loss_RMSE, Loss_PSNR, Loss_SAM, Loss_SSIM, save_matv73, Loss_CRPS
 
 import pandas as pd
 import h5py
@@ -52,7 +54,6 @@ def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=Tr
     if len(u) > 0 and verbose:
         print("unexpected keys:")
         print(u)
-    
     if sp_ckpt is not None:
         pl_sd = torch.load(sp_ckpt, map_location="cpu")
         model.spectral_model.load_state_dict(pl_sd["state_dict"], strict=True)
@@ -155,7 +156,8 @@ def parse_args():
 def main(opt):
     seed_everything(opt.seed)    
     print(f"loading data from {opt.data_root}")
-    dataset = TestDataset(data_root=opt.data_root)
+    # dataset = TestDataset(resolution=1024, arg=False)
+    dataset = TestDataset()
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
     config = OmegaConf.load(f"{opt.config}")
@@ -178,12 +180,14 @@ def main(opt):
     criterion_psnr = Loss_PSNR()
     criterion_ssim = Loss_SSIM()
     criterion_sam = Loss_SAM()
+    criterion_crps = Loss_CRPS()
     
     losses_mrae = AverageMeter()
     losses_rmse = AverageMeter()
     losses_sam = AverageMeter()
     losses_ssim = AverageMeter()
     losses_psnr = AverageMeter()
+    losses_crps = AverageMeter()
     
     # to device
     if opt.device == "cuda":
@@ -192,6 +196,7 @@ def main(opt):
         criterion_psnr.cuda()
         criterion_sam.cuda()
         criterion_ssim.cuda()
+        criterion_crps.cuda()
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -200,20 +205,6 @@ def main(opt):
         f.write(str(opt) + '\n')
     precision_scope = autocast if opt.precision=="autocast" or opt.bf16 else nullcontext
     count = 0
-    
-    data = pd.read_csv("/home/root/dataset/spectral-response-function/RGB_Camera_QE.csv", delimiter=",", index_col=0)
-    P = data.loc[400:701]
-    def group_by_tens(idx):
-        return idx // 10
-
-    # 使用 groupby 和 sum 方法每 10 个索引值求和
-    P = P.groupby(group_by_tens(P.index)).sum()
-    P = P.to_numpy()
-    P = P[:, [0, 1, 3]]
-
-    P = P / np.sum(P, axis=0, keepdims=True)
-    P = torch.from_numpy(P.T).float().to(device)
-    manifold_assemble = ManifoldAssemble(P)
 
     with torch.no_grad(), \
         precision_scope(opt.device), \
@@ -230,7 +221,6 @@ def main(opt):
                 z_rgb = model.get_first_stage_encoding(rgb_posterior)
                 uc = model.get_unconditional_conditioning(rgb.shape[0])
                 c = {'c_concat': [z_rgb], 'c_crossattn': [uc]}
-                rgb_f = torch.einsum('b c h w, l c -> b l h w', hsi, P)
                 # assert torch.allclose(rgb_t.to(torch.float32), rgb.to(torch.float32), atol=1e-2), f"error: {torch.abs(rgb_t - rgb).max()}"
                 shape = z_rgb.shape[1:]
                 # rgb = rgb_f
@@ -248,7 +238,6 @@ def main(opt):
                     hsi_est = model.spectral_model.decode(ps_hsi, rgb)
                     # hsi_est = hsi
                     samples.append(hsi_est)
-                    # output.append(hsi_est)
                     output += hsi_est
                 output /= opt.n_iter
                 
@@ -262,24 +251,27 @@ def main(opt):
                 hsi_est = output
                 hsi_est = torch.clamp(hsi_est, 0, 1)
                 hsi = torch.clamp(hsi, 0, 1)
-                rgb_t = torch.einsum('b c h w, l c -> b l h w', hsi_est, P)
-                print(f"rgb error: {torch.pow(rgb_t - rgb, 2).mean()}")
-                # loss_mrae = criterion_mrae(hsi_est, hsi)
-                # loss_rmse = criterion_rmse(hsi_est, hsi)
-                # loss_psnr = criterion_psnr(hsi_est, hsi)
-                # loss_ssim = criterion_ssim(hsi_est, hsi)
-                # loss_sam = criterion_sam(hsi_est, hsi)
+                if True:
+                    loss_mrae = criterion_mrae(hsi_est, hsi)
+                    loss_rmse = criterion_rmse(hsi_est, hsi)
+                    loss_psnr = criterion_psnr(hsi_est, hsi)
+                    loss_ssim = criterion_ssim(hsi_est, hsi)
+                    loss_sam = criterion_sam(hsi_est, hsi)
+                    loss_crps = criterion_crps(samples, hsi)
                 # loss_mrae = criterion_mrae(hsi_est[:, :, :482], hsi[:, :, :482])
                 # loss_rmse = criterion_rmse(hsi_est[:, :, :482], hsi[:, :, :482])
                 # loss_psnr = criterion_psnr(hsi_est[:, :, :482], hsi[:, :, :482])
                 # loss_ssim = criterion_ssim(hsi_est[:, :, :482], hsi[:, :, :482])
                 # loss_sam = criterion_sam(hsi_est[:, :, :482], hsi[:, :, :482])
-                loss_mrae = criterion_mrae(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
-                loss_rmse = criterion_rmse(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
-                loss_psnr = criterion_psnr(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
-                loss_ssim = criterion_ssim(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
-                loss_sam = criterion_sam(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
-                msg = f'name: {name}, mrae:{loss_mrae}, rmse:{loss_rmse}, psnr:{loss_psnr}, ssim:{loss_ssim}, sam:{loss_sam}\n'
+                else:
+                    loss_mrae = criterion_mrae(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
+                    loss_rmse = criterion_rmse(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
+                    loss_psnr = criterion_psnr(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
+                    loss_ssim = criterion_ssim(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
+                    loss_sam = criterion_sam(hsi_est[:, :, 128:-128, 128:-128], hsi[:, :, 128:-128, 128:-128])
+                    samples = [s[:, :, 128:-128, 128:-128] for s in samples]
+                    loss_crps = criterion_crps(samples, hsi[:, :, 128:-128, 128:-128])
+                msg = f'name: {name}, mrae:{loss_mrae}, rmse:{loss_rmse}, psnr:{loss_psnr}, ssim:{loss_ssim}, sam:{loss_sam}, crps:{loss_crps}\n'
                 with open(os.path.join(sample_path, "results.txt"), "a") as f:
                     f.write(msg)
                 
@@ -288,14 +280,17 @@ def main(opt):
                 losses_psnr.update(loss_psnr.data)
                 losses_ssim.update(loss_ssim.data)
                 losses_sam.update(loss_sam.data)
+                losses_crps.update(loss_crps.data)
                 if True:
                     result = hsi_est.cpu().numpy().astype(np.float32)
                     result = np.transpose(np.squeeze(result), (1, 2, 0))
                     result = np.clip(result, 0, 1)
                     mat_dir = os.path.join(sample_path, name)
                     save_matv73(mat_dir, var_name, result)
+                    save_image(hsi_est[0, 10], "output.png")
                     
-    msg = f'mrae:{losses_mrae.avg}, rmse:{losses_rmse.avg}, psnr:{losses_psnr.avg}, ssim:{losses_ssim.avg}, sam:{losses_sam.avg}'
+                    
+    msg = f'mrae:{losses_mrae.avg}, rmse:{losses_rmse.avg}, psnr:{losses_psnr.avg}, ssim:{losses_ssim.avg}, sam:{losses_sam.avg}, crps:{losses_crps.avg}'
     print(msg)
     with open(os.path.join(sample_path, "results.txt"), "a") as f:
         f.write(msg)

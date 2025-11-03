@@ -1,0 +1,12 @@
+model:
+  target: ldm.models.spectral_model.SpectralModel
+  params:
+    in_channels: 31
+    hidden_channels: 64
+    z_channels: 3
+    n_layers: 3
+    zero_encoder: False
+    zero_decoder: False
+    norm_encoder: False
+    scale: 1.0
+  
